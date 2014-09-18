@@ -1,0 +1,108 @@
+#!/usr/bin/env python
+import sys
+import argparse
+import logging
+import MySQLdb
+
+logger = logging.getLogger(__name__)
+
+
+def get_column_map(conn, database):
+    """
+    Builds dict of:
+
+    (db_name, table_name): {
+        column_name: {
+            options...
+        }
+    }
+
+    """
+    cursor = conn.cursor()
+    cursor.execute("""
+            select
+                table_schema,
+                table_name,
+                column_name,
+                data_type,
+                character_set_name,
+                collation_name
+            from information_schema.columns
+            where
+                table_schema = %s and
+                data_type in (
+                    'char', 'varchar', 'text', 'tinytext', 'mediumtext', 'longtext',
+                    'binary', 'varbinary', 'blob', 'tinyblob', 'mediumblob', 'longblob'
+                ) and
+                character_maximum_length > 1
+            order by
+                table_schema,
+                table_name,
+                ordinal_position
+            """, (database,))
+
+    column_map = {}
+    row = cursor.fetchone()
+    while row is not None:
+        key = (row[0], row[1])
+        if not key in column_map:
+            column_map[key] = {}
+        column_map[key][row[2]] = dict(
+            data_type=row[3],
+            character_set=row[4],
+            collation=row[5])
+        row = cursor.fetchone()
+
+    return column_map
+
+
+def scan_table(conn, table, columns):
+    projection = []
+    whereExprs = []
+    match_token = '<scri'
+
+    for column, options in columns.iteritems():
+        projection.append("`%s`" % column)
+        whereExprs.append("`%s` like '%%%s%%'" % (column, match_token))
+
+    query = 'select %s from `%s` where %s' % (
+        ', '.join(projection), table,
+        ' or '.join(whereExprs))
+
+    #logger.debug('Query: %s' % query)
+
+    cursor = conn.cursor()
+    cursor.execute(query)
+
+    row = cursor.fetchone()
+    while row is not None:
+        for column in projection:
+            value = row[projection.index(column)]
+            if match_token in value:
+                logger.warn('POTENTIAL XSS TAINTED DATA: %s.%s = %s' % (table, column, value))
+        row = cursor.fetchone()
+
+
+def main(host=None, database=None, username=None, password=None):
+    logger.info('Querying potentially vulnerable columns...')
+
+    conn = MySQLdb.connect(host=host, user=username, passwd=password, db=database)
+
+    column_map = get_column_map(conn, database)
+    for (_, table), columns in column_map.iteritems():
+        logger.debug('Scanning %s (%s)...' % (table, ', '.join(columns.keys())))
+        scan_table(conn, table, columns)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--host', help='Host of the database to connect to')
+    parser.add_argument('--database', help='Database name')
+    parser.add_argument('--username', help='Username')
+    parser.add_argument('--password', help='Password')
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.DEBUG)
+    main(**vars(args))
+
+
